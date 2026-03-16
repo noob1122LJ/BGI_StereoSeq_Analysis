@@ -18,10 +18,66 @@ from __future__ import annotations
 from pathlib import Path
 import re
 
+import h5py
 import numpy as np
 import pandas as pd
 import stereo as st
 
+
+
+
+def _decode_if_bytes(v):
+    if isinstance(v, (bytes, bytearray)):
+        return v.decode("utf-8", errors="ignore")
+    return str(v)
+
+
+def extract_gene_symbols_from_gef(gef_path: str) -> tuple[pd.Index | None, str | None, str | None]:
+    """Try reading gene symbol directly from common GEF HDF5 gene tables.
+
+    Returns
+    -------
+    (symbols, table_path, column_name)
+    """
+    candidate_tables = [
+        "/geneExp/bin1/gene",
+        "/geneExp/bin1/geneExp",
+        "/geneExp/gene",
+        "/gene/gene",
+        "/gene",
+    ]
+    candidate_symbol_fields = ["gene_name", "geneName", "symbol", "geneSymbol", "gene"]
+
+    try:
+        with h5py.File(gef_path, "r") as f:
+            for table_path in candidate_tables:
+                if table_path not in f:
+                    continue
+                ds = f[table_path]
+                if not hasattr(ds, "dtype") or ds.dtype.names is None:
+                    continue
+
+                names = set(ds.dtype.names)
+                symbol_col = next((c for c in candidate_symbol_fields if c in names), None)
+                if symbol_col is None:
+                    continue
+
+                vals = [_decode_if_bytes(x) for x in ds[symbol_col]]
+                vals = pd.Index(vals)
+                if len(vals) > 0 and vals.str.len().mean() > 0:
+                    return vals, table_path, symbol_col
+    except Exception as e:
+        print(f"读取 GEF 基因注释失败（将回退默认读取）: {e}")
+
+    return None, None, None
+
+
+def is_ensg_like(index: pd.Index) -> bool:
+    if len(index) == 0:
+        return False
+    probe = index[: min(500, len(index))].astype(str)
+    frac = np.mean([x.startswith(("ENSG", "ENSMUSG", "ENSGALG", "ENSDARG")) for x in probe])
+    return frac > 0.5
 
 # %% [markdown]
 """
@@ -60,8 +116,41 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 # %%
 data = st.io.read_gef(file_path=INPUT_GEF, bin_type=BIN_TYPE, bin_size=BIN_SIZE)
 data.sn = SAMPLE_NAME
+
+# 若默认读到的是 ENSG，尝试直接从 GEF 注释表提取 gene symbol 并替换
+if hasattr(data, "gene_names"):
+    current_genes = pd.Index([str(x) for x in data.gene_names])
+else:
+    current_genes = pd.Index([])
+
+if is_ensg_like(current_genes):
+    gene_symbols, hit_table, hit_col = extract_gene_symbols_from_gef(INPUT_GEF)
+    if gene_symbols is not None and len(gene_symbols) == len(current_genes):
+        data.gene_names = np.asarray(gene_symbols)
+        print("✅ 已从 GEF 注释表直接替换为 gene symbol。")
+        print(f"   命中 table path: {hit_table}")
+        print(f"   命中 column name: {hit_col}")
+    else:
+        print("⚠️ 未能从 GEF 直接提取可对齐的 gene symbol，将继续使用默认基因名。")
+
 print(data)
 
+
+# %% [markdown]
+"""
+## 2.1) 诊断：打印 GEF 实际命中的 table path + column name
+
+这个小 cell 可以单独运行，快速确认你当前 GEF 用的是哪张基因注释表、哪一列作为 symbol。
+"""
+
+# %%
+_symbols, _table, _col = extract_gene_symbols_from_gef(INPUT_GEF)
+if _table is None:
+    print("未命中候选注释表/字段（可能该 GEF 结构不同，需扩展候选路径）。")
+else:
+    print(f"GEF 命中 table path: {_table}")
+    print(f"GEF 命中 column name: {_col}")
+    print(f"提取到基因数: {len(_symbols)}")
 
 # %% [markdown]
 """
